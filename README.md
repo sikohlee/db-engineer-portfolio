@@ -20,13 +20,15 @@
 - 다중 중첩 서브쿼리 구조 개선으로 종합성적 조회 시간 단축
 - 운영 데이터 손실 없이 기능 추가에 따른 테이블 구조 변경 및 재구축 수행
 - 조건 누락으로 잘못 변경된 데이터를 백업본과 Flashback Query로 복구, 이후 사전 검증·이중 확인 절차 강화
+- 데이터 장애관련 문제 원인 분석과 테이블 전수 추적으로 찾아 정정하고 해결
 
 
 ## 목차
 
-1. [종합성적 조회 쿼리 구조 개선](#사례-1-종합성적-조회-쿼리-구조-개선) — 조회 시간 10초 → 3초
+1. [종합성적 조회 쿼리 구조 개선](#사례-1-종합성적-조회-쿼리-구조-개선) — 조회 시간 10초 > 3초
 2. [기능 추가에 따른 테이블 구조 변경 및 재구축](#사례-2-기능-추가에-따른-테이블-구조-변경-및-재구축)
 3. [데이터 변경 작업 절차 수립 및 오삭제 복구](#사례-3-데이터-변경-작업-절차-수립-및-오삭제-복구)
+4. [데이터 장애 원인 추적 및 정정](#사례-4-데이터-장애-원인-추적-및-정정)
 
 ---
 
@@ -378,3 +380,96 @@ COMMIT;
 </details>
 
 원복 후에는 원래 의도했던 1건 수정을 올바른 조건으로 다시 수행했습니다. Flashback은 Undo 보존 기간 안에서만 가능하므로 사전 백업을 기본 원칙으로 두었습니다.
+
+---
+
+## 사례 4. 데이터 장애 원인 추적 및 정정
+
+동명이인 두 학생의 신상정보가 서로 바뀌어 증명서에 잘못 출력되는 문제를, 관련 테이블을 전수 추적해 정정했습니다.
+
+**문제**
+외부 인터넷 증명서 발급 시 동명이인 두 학생(교번 18434, 18435)의 신상정보가 서로 바뀌어 출력된다는 민원이 접수되었습니다. 신상정보는 DB 담당자 외에는 수정할 수 없어 DB 작업으로 정정이 필요했습니다.
+
+**분석**
+증명서가 참조하는 뷰와 원본 테이블을 확인한 뒤, 신상정보 컬럼을 가진 테이블을 딕셔너리 뷰로 전수 조회해 수정 대상 2개 테이블을 특정했습니다. 원인은 최초 데이터 입력 시 행정실 실무자의 입력 실수였습니다.
+
+**조치**
+1. 두 학생의 데이터를 행정실 원본 서류와 대조해 오입력 확인
+2. 수정 대상 테이블의 두 학생 데이터 백업
+3. 백업본을 기준으로 두 교번의 신상정보를 맞교환
+4. 백업본과 비교해 정확히 교환되었는지 검증 후 행정실 담당자와 이중 확인
+
+**결과**
+2개 테이블의 신상정보를 정정하고 증명서 재출력으로 정상 출력을 확인해 민원을 해결했습니다.
+
+### 예시 쿼리 (가상, 일반화된 명칭)
+
+증명서 > 참조 테이블 > 신상정보 컬럼 보유 테이블 순으로 추적한 뒤, 백업본을 기준으로 두 교번의 데이터를 맞교환하고 검증했습니다. ([sql/case4_trace.sql](./sql/case4_trace.sql))
+
+<details>
+<summary>쿼리 보기</summary>
+
+```sql
+-- 사례 4. 동명이인 신상정보 오입력 추적 및 정정 (가상, 일반화된 명칭)
+-- 상황: 동명이인인 교번 18434, 18435 두 학생의 신상정보가 서로 바뀌어 증명서에 출력됨
+-- 원인: 최초 데이터 입력 시 행정실 실무자의 입력 실수
+--       (신상정보는 DB 담당자 외 수정 불가하여 DB 작업으로 정정)
+
+-- 1. 증명서가 참조하는 원본 테이블 확인
+SELECT REFERENCED_NAME, REFERENCED_TYPE
+  FROM ALL_DEPENDENCIES
+ WHERE NAME = 'CERT_STD_INFO_V';            -- 증명서용 신상정보 뷰
+
+-- 2. 신상정보 컬럼을 가진 테이블 전수 확인 (증명서 외 화면에도 쓰이는 테이블까지)
+SELECT TABLE_NAME, COLUMN_NAME
+  FROM ALL_TAB_COLUMNS
+ WHERE TABLE_NAME IN (SELECT TABLE_NAME FROM ALL_TAB_COLUMNS
+                       WHERE COLUMN_NAME = 'STD_NO')
+   AND COLUMN_NAME IN ('BIRTH_DT', 'ADDR', 'TEL_NO', 'EMAIL')
+ ORDER BY TABLE_NAME, COLUMN_NAME;
+-- > 수정 대상: STD_MASTER(학적 기본), STD_PERSONAL(신상)
+
+-- 3. 두 학생 데이터 확인 (행정실 원본 서류와 대조)
+SELECT STD_NO, STD_NM, BIRTH_DT FROM STD_MASTER
+ WHERE STD_NO IN ('18434', '18435');
+SELECT STD_NO, ADDR, TEL_NO, EMAIL FROM STD_PERSONAL
+ WHERE STD_NO IN ('18434', '18435');
+
+-- 4. 수정 전 백업 (두 학생 데이터만)
+CREATE TABLE STD_MASTER_BAK_20230410 AS
+SELECT * FROM STD_MASTER   WHERE STD_NO IN ('18434', '18435');
+CREATE TABLE STD_PERSONAL_BAK_20230410 AS
+SELECT * FROM STD_PERSONAL WHERE STD_NO IN ('18434', '18435');
+
+-- 5. 두 교번의 신상정보 맞교환 (백업본에서 상대 교번의 값을 가져옴)
+UPDATE STD_MASTER M
+   SET M.BIRTH_DT = (SELECT B.BIRTH_DT
+                       FROM STD_MASTER_BAK_20230410 B
+                      WHERE B.STD_NO = DECODE(M.STD_NO, '18434', '18435', '18435', '18434'))
+ WHERE M.STD_NO IN ('18434', '18435');
+
+UPDATE STD_PERSONAL P
+   SET (P.ADDR, P.TEL_NO, P.EMAIL) =
+       (SELECT B.ADDR, B.TEL_NO, B.EMAIL
+          FROM STD_PERSONAL_BAK_20230410 B
+         WHERE B.STD_NO = DECODE(P.STD_NO, '18434', '18435', '18435', '18434'))
+ WHERE P.STD_NO IN ('18434', '18435');
+
+-- 6. 검증: 백업본의 교번을 바꿔 비교 (모두 0건이면 정상 교환)
+SELECT DECODE(STD_NO, '18434', '18435', '18435', '18434') AS STD_NO, BIRTH_DT
+  FROM STD_MASTER_BAK_20230410
+MINUS
+SELECT STD_NO, BIRTH_DT FROM STD_MASTER WHERE STD_NO IN ('18434', '18435');
+
+SELECT DECODE(STD_NO, '18434', '18435', '18435', '18434') AS STD_NO, ADDR, TEL_NO, EMAIL
+  FROM STD_PERSONAL_BAK_20230410
+MINUS
+SELECT STD_NO, ADDR, TEL_NO, EMAIL FROM STD_PERSONAL WHERE STD_NO IN ('18434', '18435');
+
+-- 7. 행정실 담당자와 이중 확인 후 반영, 증명서 재출력으로 최종 확인
+COMMIT;
+```
+
+</details>
+
+두 행을 서로 바꿀 때 한쪽을 먼저 덮어쓰면 원래 값이 사라지기 때문에, 백업본에서 DECODE로 상대 교번의 값을 가져오는 방식으로 교환했습니다. 검증 단계에서도 백업본의 교번을 뒤집어 현재 데이터와 비교해, 0건이 나오는 것으로 정확한 교환을 확인했습니다.
